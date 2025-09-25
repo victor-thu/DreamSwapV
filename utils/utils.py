@@ -12,6 +12,8 @@ from moviepy.editor import concatenate_videoclips, ImageSequenceClip
 from scipy.ndimage import gaussian_filter
 from collections import OrderedDict, deque
 from skimage import exposure
+from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import save_file
 
 from .dwpose import draw_pose
 from models.attention import BasicTransformerBlock

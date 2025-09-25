@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Single-video WanX 推理脚本（首帧 mask 版，精简）
--------------------------------------------------
-输入：单个视频 + 首帧二值 mask(.png) + 参考图(带透明更佳)
-流程：SegTracker 追踪 → pose/hand → mask_augmentation → WanX 推理
-输出：{vid}_{refstem}.mp4 和（可选）{vid}_{refstem}_debug.mp4
-说明：保留原脚本的核心推理逻辑与跨段衔接，移除 benchmark / 多进程。
+Single-video DreamSwapV 推理脚本
+Author: victor-thu
+Date: 2025/9/20
 """
 
 import os
 import cv2
-import time
 import argparse
 from pathlib import Path
 from PIL import Image
@@ -68,6 +64,8 @@ def split_segments(total, max_length):
     start = 0
     while start < total:
         end = min(start + max_length, total)
+        if end - start == 1:
+            break
         while (end - start) % 4 != 1:
             end -= 1
             if end - start <= 0:
@@ -199,14 +197,29 @@ def read_video_to_pil(path: str, max_frames: int = None):
     return frames, first, fps
 
 def concat_imgs_h(imgs):
-    """横向拼接 PIL 图片"""
-    w = sum(i.width for i in imgs)
-    h = max(i.height for i in imgs)
-    dst = Image.new("RGB", (w, h))
+    """横向拼接 PIL 图片，按最小高度等比缩放并底对齐"""
+    # 1. 找到最小高度
+    min_h = min(img.height for img in imgs)
+
+    # 2. 缩放所有图片到相同高度
+    scaled_imgs = []
+    for img in imgs:
+        if img.height != min_h:
+            # 按比例缩放宽度
+            new_w = int(img.width * min_h / img.height)
+            img = img.resize((new_w, min_h), Image.LANCZOS)
+        scaled_imgs.append(img)
+
+    # 3. 计算总宽度并新建画布
+    total_w = sum(im.width for im in scaled_imgs)
+    dst = Image.new("RGB", (total_w, min_h))
+
+    # 4. 拼接
     x = 0
-    for im in imgs:
+    for im in scaled_imgs:
         dst.paste(im, (x, 0))
         x += im.width
+
     return dst
 
 # ------------------------------ 主流程 ------------------------------
@@ -227,7 +240,7 @@ def run_single(args):
     device = torch.device(args.device)
     logger.info(f"Device: {device}")
 
-    # prompt embeds（不需要 prompt，用零向量）
+    # prompt embeds（不需要 prompt，wanx 原接口用零向量）
     prompt_embeds = torch.zeros((1, 6, 4096))
 
     # 模型
@@ -236,7 +249,7 @@ def run_single(args):
     transformer.set_attn_processor(WanAttnProcessorFlash())
 
     vae = AutoencoderKLWan.from_pretrained(
-        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",  # HF 仓库名
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",  
         subfolder="vae",
         torch_dtype=torch.float16
     ).to(device)
@@ -246,7 +259,7 @@ def run_single(args):
         num_train_timesteps=1000,
         flow_shift=5
     )
-    wanx_pipe = WanImageToVideoPipeline(transformer, vae, scheduler, None)
+    dreamswapv_pipe = WanImageToVideoPipeline(transformer, vae, scheduler, None)
 
     # DWPose / Hamer
     gpu_idx = 0 if "cuda" in args.device else -1
@@ -254,19 +267,15 @@ def run_single(args):
     hand_drawer     = Hamer(gpu_idx if gpu_idx>=0 else 0)
 
     # 视频与尺寸
-    video_list, first_frame_bgr, fps = read_video_to_pil(str(video_path))
-    frame_length = len(video_list)
-    if frame_length == 0:
-        raise RuntimeError("No frames read from video!")
-
     # 缩放：短边≤720 且对齐16
-    orig_h, orig_w = first_frame_bgr.shape[:2]
+    orig_h, orig_w = args.height, args.width
     min_dim = min(orig_h, orig_w)
     scale   = 720.0 / min_dim if min_dim > 720 else 1.0
     scaled_h, scaled_w = int(orig_h * scale), int(orig_w * scale)
     height = ((scaled_h + 15) // 16) * 16
     width  = ((scaled_w  + 15) // 16) * 16
-    logger.info(f"Aligned size: {width}x{height} (fps={fps:.2f}, frames={frame_length})")
+
+    video_list, first_frame_bgr, fps = read_video_to_pil(str(video_path), max_frames=args.total_length)
 
     # 参考图准备（灰底转 RGB → canvas 居中）
     refimg_list = [load_ref_with_gray_bg(str(ref_path))]
@@ -276,18 +285,15 @@ def run_single(args):
     tracker = init_SegTracker(first_frame_bgr, gpu_id=gpu_idx if gpu_idx>=0 else 0)
     fm_pil = Image.open(first_mask_path).convert("L")
 
-    # 若首帧 mask 尺寸与首帧图不同，自动 resize 到首帧大小
-    if (fm_pil.size[0] != first_frame_bgr.shape[1]) or (fm_pil.size[1] != first_frame_bgr.shape[0]):
-        fm_pil = fm_pil.resize((first_frame_bgr.shape[1], first_frame_bgr.shape[0]), Image.NEAREST)
-
     tracker = segtracker_add_first_frame(tracker, first_frame_bgr, np.array(fm_pil))
-    tracked = tracking_masks(tracker, str(video_path), frame_length, fps)
+    tracked = tracking_masks(tracker, str(video_path), len(video_list), fps)
     masks_np = [np.array(fm_pil)] + [np.array(m) for m in tracked[1:]]
     mask_list = [Image.fromarray(m.astype(np.uint8)) for m in masks_np]
+    # mask_list = [resize_and_centercrop(i, height, width) for i in mask_list]
 
-    # 分段（满足 4n+1，且段长≤max_seg_len）
-    max_seg_len = ensure_4n_plus_1_leq(args.max_seg_len)
-    segments = split_segments(frame_length, max_seg_len)
+    # 分段（满足 4n+1，且段长≤frame_length）
+    frame_length = ensure_4n_plus_1_leq(args.frame_length)
+    segments = split_segments(len(video_list), frame_length)
     logger.info(f"Segments: {segments} (count={len(segments)})")
 
     # 输出命名
@@ -321,9 +327,12 @@ def run_single(args):
             pose_final = overlay_images(pose_img, hand_img)
             pose_list.append(resize_and_centercrop(pose_final, height, width))
 
-        # 调用 WanX（保留 first_inpainted_frame 跨段衔接）
+        seg_videos = [resize_and_centercrop(i, height, width) for i in seg_videos]
+        seg_masks  = [resize_and_centercrop(i, height, width) for i in seg_masks]
+
+        # call pipeline
         with torch.cuda.amp.autocast():
-            seg_out = wanx_pipe.__mask_call__(
+            seg_out = dreamswapv_pipe.__mask_call__(
                 prompt=None,
                 prompt_embeds=prompt_embeds,
                 height=height, width=width,
@@ -381,10 +390,13 @@ def run_single(args):
             )
         export_to_video(debug_frames, str(debug_path), fps=fps)
         logger.info(f"Saved debug: {debug_path}")
+    
+    del video_list, mask_list
+    torch.cuda.empty_cache()
 
 # ------------------------------ CLI ------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Single-video WanX inference with first-frame mask")
+    p = argparse.ArgumentParser(description="Single-video DreamSwapV inference with first-frame mask")
     p.add_argument("--video", required=True, help="输入视频路径（.mp4）")
     p.add_argument("--first_mask", required=True, help="首帧二值 mask（L 模式，白=前景），尺寸自动对齐首帧")
     p.add_argument("--ref", required=True, help="参考图路径（要求透明 PNG）")
@@ -395,8 +407,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=44)
     p.add_argument("--guidance_scale", type=float, default=1.5)
     p.add_argument("--num_steps", type=int, default=50, help="推理步数")
-    p.add_argument("--max_seg_len", type=int, default=999999, help="分段最长帧数（将自动调整为 4n+1）")
     p.add_argument("--save_debug", action="store_true", help="保存 debug 横拼视频")
+    p.add_argument("--total_length", type=int, default=None, help="生成视频的长度，置空则默认生成全长视频")
+    p.add_argument("--frame_length", type=int, default=69, help="分段长度，默认为训练长度69，要求为4n+1，一般情况不建议调整")
+    p.add_argument("--height", type=int, default=1280, help="生成视频的高度")
+    p.add_argument("--width", type=int, default=720, help="生成视频的宽度")
 
     return p.parse_args()
 

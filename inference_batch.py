@@ -1,36 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Benchmark‑based WanX 推理脚本
--------------------------------------------------
-❶ 手动配置区（最上方几行变量即可）
-❷ 自动遍历 bench_root 下的 lands_mask / verti_mask 结构
-❸ 读取原视频 + 69 帧二值 mask(.png) + 透明 reference 图
-❹ 下采样到短边 720、对齐 16 倍数 → 送入原推理流程
-❺ 输出   {vid}_{refstem}.mp4  和  {vid}_{refstem}_debug.mp4
-其余逻辑（pose / hand / mask_augmentation / WanX pipeline 等）无改动
+Benchmark-based DreamSwapV 推理脚本
+Author: victor-thu
+Date: 2025/9/20
 """
-
-# ---------------------------- ❶ 手动配置区 ----------------------------
-BENCH_ROOT      = "/mnt/bn/lyl/wwt/wanx_video_pose/benchmark"          # benchmark 根目录
-CHECKPOINT_PATH = "/mnt/bn/lyl/wwt/wanx_video_pose/highres32dilatefull_checkpoint-17500/output_dir"
-OUTPUT_DIR      = "/mnt/bn/lyl/wwt/wanx_video_pose/benchmark_results_full17500_kh60_cfg1.5_full/"
-GUIDANCE_SCALE  = 1.5
-FRAME_LENGTH    = 69                      # 固定 69 帧
-SEED            = 44
-
-ALLOW_LIST = {
-    "14071724", "4623570",
-    "5057325", "6520307", "7187515", "8970369", "9017890",
-    "855564"
-}
-# --------------------------------------------------------------------
-
 import os
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 import cv2
-import copy
-import time
+import argparse
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -70,8 +48,6 @@ from utils.sam.SegTracker          import SegTracker
 
 
 # -------------------------- 工具 / 辅助函数 --------------------------
-# --------------- 片段长度设置（符合 WanX 对 4n+1 的要求） ---------------
-MAX_SEG_LEN = 200            # 65 = 4×16 + 1，可根据显存改小
 
 # ---------------------- 分段：overlap = 1 帧 ----------------------
 def split_segments(total, max_length):
@@ -85,6 +61,8 @@ def split_segments(total, max_length):
     start = 0
     while start < total:
         end = min(start + max_length, total)
+        if end - start == 1:
+            break
         while (end - start) % 4 != 1:
             end -= 1
             if end - start <= 0:
@@ -171,11 +149,6 @@ def build_tasks_from_benchmark(bench_root: str) -> list[dict]:
         lands_video/ | verti_video/
             {video_name}.mp4
     """
-    def num_pref(name: str) -> str | None:
-        """捕获文件/文件夹开头的连续数字，如 '852122-hd...' → '852122'"""
-        m = re.match(r"^(\d+)", name)
-        return m.group(1) if m else None
-
     tasks = []
 
     for t in ("lands", "verti"):
@@ -189,9 +162,17 @@ def build_tasks_from_benchmark(bench_root: str) -> list[dict]:
                 continue
             video_name = video_dir.name
 
-            vid_id = num_pref(video_name)           # ← 提取数字前缀
-            if vid_id not in ALLOW_LIST:            # ← 不在名单，跳过
-                continue
+            # 可选，指定 benchmark 中想要专门跑的一些视频
+            # def num_pref(name: str) -> str | None:
+            #     """捕获文件/文件夹开头的连续数字，如 '852122-hd...' → '852122'"""
+            #     m = re.match(r"^(\d+)", name)
+            #     return m.group(1) if m else None
+            # ALLOW_LIST = {
+            #     "14071724", "4623570", "5057325", "6520307", "7187515", "8970369", "9017890", "855564"
+            # }
+            # vid_id = num_pref(video_name)           # ← 提取数字前缀
+            # if vid_id not in ALLOW_LIST:            # ← 不在名单，跳过
+            #     continue
 
             video_path = video_root / f"{video_name}.mp4"
             if not video_path.exists():
@@ -295,13 +276,13 @@ def mask_augmentation(image, mask, mask_color=(128, 128, 128), bounding=False):
     )
     return Image.fromarray((new_mask * 255).astype(np.uint8)), Image.fromarray(agnostic_image.astype(np.uint8))
 
-def read_video_to_pil(path: str, frame_length=FRAME_LENGTH):
+def read_video_to_pil(path: str, max_frames=69):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     frames, first = [], None
-    for i in range(frame_length):
+    for i in range(max_frames):
         success, frame = cap.read()
         if not success:
             break
@@ -312,35 +293,61 @@ def read_video_to_pil(path: str, frame_length=FRAME_LENGTH):
     cap.release()
     return frames, first, fps
 
+def concat_imgs_h(imgs):
+    """横向拼接 PIL 图片，按最小高度等比缩放并底对齐"""
+    # 1. 找到最小高度
+    min_h = min(img.height for img in imgs)
+
+    # 2. 缩放所有图片到相同高度
+    scaled_imgs = []
+    for img in imgs:
+        if img.height != min_h:
+            # 按比例缩放宽度
+            new_w = int(img.width * min_h / img.height)
+            img = img.resize((new_w, min_h), Image.LANCZOS)
+        scaled_imgs.append(img)
+
+    # 3. 计算总宽度并新建画布
+    total_w = sum(im.width for im in scaled_imgs)
+    dst = Image.new("RGB", (total_w, min_h))
+
+    # 4. 拼接
+    x = 0
+    for im in scaled_imgs:
+        dst.paste(im, (x, 0))
+        x += im.width
+
+    return dst
+
 # ------------------------------ main 逻辑 ------------------------------
 def main(args):
     (tasks, output_dir, checkpoint_path, guidance_scale,
-     frame_length, width, height, seed, cuda_idx) = args
+     frame_length, seed, num_steps, 
+     save_debug, total_length, cuda_idx) = args
+    
+    os.makedirs(output_dir, exist_ok=True)
 
     rank   = int(os.environ.get("RANK", 0))
     logger = setup_logger(f"gpu{cuda_idx}", f"./log/RANK_{rank}_cuda{cuda_idx}.log")
     device = torch.device(f"cuda:{cuda_idx}")
     logger.info(f"Device set: {device}")
 
-    # prompt embeds
-    saved_prompt_embeds = "/mnt/bn/lyl/mlx/users/fanxirui.siri/playground/pose_drive_0314/sd_video_pose/prompt_embeds_wanx.pkl"
-    prompt_embeds = torch.zeros((1, 77, 768))
-    if os.path.exists(saved_prompt_embeds):
-        with open(saved_prompt_embeds, "rb") as f:
-            data = pkl.load(f)
-        prompt_embeds = torch.from_numpy(data["context"][0]).repeat(1, 1, 1)
-        logger.info("Loaded saved_prompt_embeds")
+    # prompt embeds（不需要 prompt，wanx 原接口用零向量）
+    prompt_embeds = torch.zeros((1, 6, 4096))
 
     # model
     transformer, _ = get_wanx_diffusers(None, checkpoint_path, use_text_encoder=False, use_fa3=True)
     transformer = transformer.to(device, dtype=torch.bfloat16)
     transformer.set_attn_processor(WanAttnProcessorFlash())
 
-    vae_dir   = "/mnt/bn/lyl/mlx/users/fanxirui.siri/playground/hyvideo_dev/sd_video_pose/wanx_models/Wan2.1-I2V-14B-720P-Diffusers"
-    vae       = AutoencoderKLWan.from_pretrained(vae_dir, subfolder="vae", torch_dtype=torch.float16).to(device)
+    vae = AutoencoderKLWan.from_pretrained(
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers", 
+        subfolder="vae",
+        torch_dtype=torch.float16
+    ).to(device)
     scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True,
                                         num_train_timesteps=1000, flow_shift=5)
-    wanx_pipe = WanImageToVideoPipeline(transformer, vae, scheduler, saved_prompt_embeds)
+    dreamswapv_pipe = WanImageToVideoPipeline(transformer, vae, scheduler, None)
 
     dwpose_detector = DWposeDetector(cuda_idx=cuda_idx)
     hand_drawer     = Hamer(cuda_idx)
@@ -358,7 +365,7 @@ def main(args):
         refimg_list = [load_ref_with_gray_bg(p) for p in task["refimg_path"]]
 
         # video frames
-        video_list, first_frame, fps = read_video_to_pil(task["video_path"], frame_length=MAX_SEG_LEN)
+        video_list, first_frame, fps = read_video_to_pil(task["video_path"], max_frames=total_length)
         frame_length = len(video_list)
 
         # mask list (69 png)
@@ -366,19 +373,14 @@ def main(args):
         # 首帧 BGR（cv2 格式）已在 read_video_to_pil() 里拿到 first_frame
         tracker = init_SegTracker(first_frame, gpu_id=cuda_idx)
 
-        # 1️⃣ 如有 “首帧手动画” mask，可直接加载；否则用 Grounding-DINO 自动检测
+        # 加载首帧 mask
         first_mask_path = task.get("first_mask_path")
-        if first_mask_path and Path(first_mask_path).exists():
-            fm_pil = Image.open(first_mask_path).convert("L")
-            tracker = SegTracker_add_first_frame(tracker, first_frame, np.array(fm_pil))
-            masks_np = [np.array(fm_pil)] + [np.array(m)                   # 👈 新增
-                                 for m in tracking_objects(
-                                     tracker, task["video_path"],
-                                     len(video_list), fps)[1:]]
-        else:
-            tracker, fm_np, _ = gd_detect(
-                tracker, cuda_idx, first_frame, task["caption"])
-            masks_np = [fm_np] + [np.array(m) for m in tracking_objects(...)[1:]]
+        fm_pil = Image.open(first_mask_path).convert("L")
+        tracker = SegTracker_add_first_frame(tracker, first_frame, np.array(fm_pil))
+        masks_np = [np.array(fm_pil)] + [np.array(m)                   
+                                for m in tracking_objects(
+                                    tracker, task["video_path"],
+                                    len(video_list), fps)[1:]]
 
         mask_list = [Image.fromarray(m.astype(np.uint8)) for m in masks_np]
 
@@ -392,15 +394,14 @@ def main(args):
         scale   = 720.0 / min_dim if min_dim > 720 else 1.0
         scaled_h, scaled_w = int(orig_h * scale), int(orig_w * scale)
         height = ((scaled_h + 15) // 16) * 16
-        width  = ((scaled_w  + 15) // 16) * 16
+        width  = ((scaled_w + 15) // 16) * 16
 
         # ----------- (A) 准备收集全片输出 / debug -----------
         final_outputs, final_video, final_mask, final_pose, final_agnostic = [], [], [], [], []
         first_inpainted_frame = None      # 核心衔接变量
 
         # 分段
-        segments = split_segments(len(video_list), FRAME_LENGTH)
-        print("-------------", len(segments))
+        segments = split_segments(len(video_list), frame_length)
 
         for seg_idx, (s, e) in enumerate(segments):
             seg_videos = video_list[s:e]
@@ -426,17 +427,20 @@ def main(args):
                 pose_final = overlay_images(pose_img, hand_img)
                 pose_list.append(resize_and_centercrop(pose_final, height, width))
 
+            seg_videos = [resize_and_centercrop(i, height, width) for i in seg_videos]
+            seg_masks  = [resize_and_centercrop(i, height, width) for i in seg_masks]
+
             refimg_list = [center_image_to_canvas(i, (width, height)) for i in refimg_list]
 
-            # ---------- (C) 调用 WanX，传入 first_inpainted_frame ----------
+            # ---------- (C) call pipeline ----------
             with torch.cuda.amp.autocast():
-                seg_out = wanx_pipe.__mask_call__(
+                seg_out = dreamswapv_pipe.__mask_call__(
                     prompt=None,
                     prompt_embeds=prompt_embeds,
                     height=height, width=width,
                     video_length=len(seg_videos),
-                    seed=SEED,
-                    num_inference_steps=50,
+                    seed=seed,
+                    num_inference_steps=num_steps,
                     guidance_scale=guidance_scale,
                     ref_img=refimg_list,
                     mask_image=new_mask_list,
@@ -444,7 +448,7 @@ def main(args):
                     pose_image=pose_list,
                     num_videos_per_prompt=1,
                     device=device,
-                    first_inpainted_frame=first_inpainted_frame   # ←← 新增
+                    first_inpainted_frame=first_inpainted_frame
                 ).frames[0]
 
             # 更新 first_inpainted_frame (= 本段最后一帧, PIL 格式)
@@ -475,41 +479,54 @@ def main(args):
         logger.info(f"Saved: {output_path}")
 
         # ----------- (F) debug 拼接 -----------
-        def concat_imgs(imgs):
-            w = sum(i.width for i in imgs); h = max(i.height for i in imgs)
-            dst = Image.new("RGB", (w, h)); x = 0
-            for im in imgs: dst.paste(im, (x, 0)); x += im.width
-            return dst
-
-        debug_frames = []
-        for i, out_frame in enumerate(final_outputs):
-            debug_frames.append(concat_imgs(
-                refimg_list + [final_video[i], final_mask[i], final_agnostic[i], final_pose[i],
-                            Image.fromarray((out_frame * 255).astype(np.uint8))]))
-        export_to_video(debug_frames, debug_output_path, fps=fps)
-        logger.info(f"Saved debug: {debug_output_path}")
+        if save_debug:
+            debug_frames = []
+            for i, out_frame in enumerate(final_outputs):
+                debug_frames.append(concat_imgs_h(
+                    refimg_list + [final_video[i], final_mask[i], final_agnostic[i], final_pose[i],
+                                Image.fromarray((out_frame * 255).astype(np.uint8))]))
+            export_to_video(debug_frames, debug_output_path, fps=fps)
+            logger.info(f"Saved debug: {debug_output_path}")
 
 
         del video_list, mask_list
         torch.cuda.empty_cache()
 
+# ------------------------------ CLI ------------------------------
+def parse_args():
+    os.makedirs("./log", exist_ok=True)
+    p = argparse.ArgumentParser(description="Benchmark-based DreamSwapV inference with first-frame mask")
+    p.add_argument("--bench_root", required=True, help="benchmark 路径，用于读取 video, first-frame mask 和 reference")
+    p.add_argument("--checkpoint", required=True, help="DreamSwapV checkpoint 路径")
+
+    p.add_argument("--output_dir", default="./outputs", help="输出目录")
+    p.add_argument("--seed", type=int, default=44)
+    p.add_argument("--guidance_scale", type=float, default=1.5)
+    p.add_argument("--num_steps", type=int, default=50, help="推理步数")
+    p.add_argument("--save_debug", action="store_true", help="保存 debug 横拼视频")
+    p.add_argument("--total_length", type=int, default=69, help="生成视频的长度，置空则默认生成全长视频，DreamSwapV-benchmark 中使用69帧比较")
+    p.add_argument("--frame_length", type=int, default=69, help="分段长度，默认为训练长度69，要求为4n+1，一般情况不建议调整")
+
+    return p.parse_args()
+
 
 # --------------------------- 入口：多进程切片 ---------------------------
 if __name__ == "__main__":
-    os.makedirs("./log", exist_ok=True)
+    args = parse_args()
     try:
         mp.set_start_method("spawn", force=True)
     except Exception:
         pass
 
-    all_tasks = build_tasks_from_benchmark(BENCH_ROOT)
+    all_tasks = build_tasks_from_benchmark(args.bench_root)
     if not all_tasks:
         raise RuntimeError("No tasks found in benchmark path!")
 
     num_gpu = int(os.environ.get("ARNOLD_WORKER_GPU", "1"))
     tasks_split = [
-        (all_tasks[i::num_gpu], OUTPUT_DIR, CHECKPOINT_PATH, GUIDANCE_SCALE,
-         FRAME_LENGTH, 1280, 720, SEED, i)
+        (all_tasks[i::num_gpu], args.output_dir, args.checkpoint, args.guidance_scale,
+         args.frame_length, args.seed, args.num_steps, 
+         args.save_debug, args.total_length, i) 
         for i in range(num_gpu)
     ]
 

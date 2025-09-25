@@ -13,8 +13,8 @@ from torchvision.ops import box_convert
 
 class Detector:
     def __init__(self, device):
-        config_file = "/mnt/bn/lyl/wwt/wanx_video_pose/utils/sam/src/groundingdino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-        grounding_dino_ckpt = '/mnt/bn/lyl/wwt/wanx_video_pose/utils/sam/ckpt/groundingdino_swint_ogc.pth'
+        config_file = "./utils/sam/src/groundingdino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+        grounding_dino_ckpt = './utils/sam/ckpt/groundingdino_swint_ogc.pth'
         args = SLConfig.fromfile(config_file) 
         args.device = device
         self.device = device

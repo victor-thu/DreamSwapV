@@ -1,6 +1,6 @@
 # Explanation of generator_args is in sam/segment_anything/automatic_mask_generator.py: SamAutomaticMaskGenerator
 sam_args = {
-    'sam_checkpoint': "/mnt/bn/lyl/wwt/wanx_video_pose/utils/sam/ckpt/sam_vit_b_01ec64.pth",
+    'sam_checkpoint': "./utils/sam/ckpt/sam_vit_b_01ec64.pth",
     'model_type': "vit_b",
     'generator_args':{
         'points_per_side': 16,
@@ -15,7 +15,7 @@ sam_args = {
 aot_args = {
     'phase': 'PRE_YTB_DAV',
     'model': 'r50_deaotl',
-    'model_path': '/mnt/bn/lyl/wwt/wanx_video_pose/utils/sam/ckpt/R50_DeAOTL_PRE_YTB_DAV.pth',
+    'model_path': './utils/sam/ckpt/R50_DeAOTL_PRE_YTB_DAV.pth',
     'long_term_mem_gap': 9999,
     'max_len_long_term': 9999,
     'gpu_id': 1,
