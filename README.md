@@ -5,6 +5,12 @@
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue)](https://huggingface.co/victor-thu/DreamSwapV)
 </div>
 
+## 📅 TODO
+[x] Page and video demo
+[x] Model weights
+[x] Inference code
+[ ] DreamSwapV-Benchmark
+
 ## 💻 Getting Started
 ### 📑 Requirements
 ```
