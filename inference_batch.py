@@ -12,11 +12,10 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-"""
-Benchmark-based DreamSwapV 推理脚本
-Author: victor-thu
-Date: 2025/9/20
-"""
+# Benchmark-based DreamSwapV 推理脚本
+# Author: victor-thu
+# Date: 2025/9/20
+
 import os
 import cv2
 import argparse
