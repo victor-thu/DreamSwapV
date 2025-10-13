@@ -57,6 +57,7 @@ We provide scripts for single video inference and benchmark batch inference:
 # single inference
 python inference.py --video your_mp4_path --first_mask the_first_frame_mask_of_your_mp4 --ref the_reference_you_want_to_inject
                     --checkpoint your_dreamswapv_ckpt_path --output_dir ./outputs --device cuda:0 --save_debug
+
 # benchmark inference
 python inference_batch.py --bench_root your_benchmark_path --checkpoint your_dreamswapv_ckpt_path --output_dir ./outputs --save_debug
 ```
@@ -72,7 +73,7 @@ We would like to thank the contributors to the following repositories, for their
 Licenses for borrowed code and third-party dependencies can be found in [code_licenses.md](https://code.byted.org/wangweitao.owl/DreamSwapV/blob/main/code_licenses.md) and [third_party.txt](https://code.byted.org/wangweitao.owl/DreamSwapV/blob/main/third_party.txt) file. 
 
 ### License
-The project is licensed under the [Apache2.0 license](https://code.byted.org/wangweitao.owl/DreamSwapV/blob/main/LICENSE.txt). To utilize or further develop this project for commercial purposes through proprietary means, permission must be granted by us (as well as the owners of any borrowed code).
+The project is licensed under the [Apache 2.0 license](https://code.byted.org/wangweitao.owl/DreamSwapV/blob/main/LICENSE.txt). To utilize or further develop this project for commercial purposes through proprietary means, permission must be granted by us (as well as the owners of any borrowed code).
 
 ### Citations
 Please consider citing the related paper(s) in your publications if it helps your research.
