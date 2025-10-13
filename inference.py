@@ -12,11 +12,9 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-"""
-Single-video DreamSwapV 推理脚本
-Author: victor-thu
-Date: 2025/9/20
-"""
+# Single-video DreamSwapV 推理脚本
+# Author: victor-thu
+# Date: 2025/9/20
 
 import os
 import cv2
