@@ -616,8 +616,11 @@ class WanAttnProcessorFlash:
 def get_wanx_diffusers(args, model_dir=None, use_text_encoder=False, use_fa3=False):
     # =========================== Build main model ===========================
     logger.info("Building transformer...")
-    ckpt_path = "/mnt/bn/lyl/mlx/users/fanxirui.siri/playground/hyvideo_dev/sd_video_pose/wanx_models/Wan2.1-I2V-14B-720P-Diffusers"
-    with open(os.path.join(ckpt_path, 'transformer/config_wwt_pose.json'), 'r') as f:
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(current_dir, '..', 'config.json')
+
+    with open(config_path, 'r') as f:
         config = json.load(f)
     model = WanTransformer3DModel.from_config(config)
 
@@ -635,11 +638,8 @@ def get_wanx_diffusers(args, model_dir=None, use_text_encoder=False, use_fa3=Fal
     text_encoder = None
     if use_text_encoder:
         logger.info("Building text_encoder...")
-        text_encoder_dir = os.path.join(ckpt_path, 'text_encoder')
-        # with open(os.path.join(text_encoder_dir, 'config.json'), 'r') as f:
-        #     config = json.load(f)
-        # text_encoder = T5EncoderModel.from_config(config)
-        text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_dir)
-        # text_encoder = load_state_dict_safetensors(args, text_encoder, text_encoder_dir)
+        # DreamSwapV 没有用到 text_encoder
+        # text_encoder_dir = os.path.join(ckpt_path, 'text_encoder')
+        # text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_dir)
 
     return model, text_encoder
